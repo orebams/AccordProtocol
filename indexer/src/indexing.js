@@ -11,7 +11,9 @@ export async function indexEventBatch({
 }) {
   const tokenNames = new Map(tokens.map(({ name, address }) => [address.toLowerCase(), name]));
   let cursor = store.getState("event_cursor");
-  let nextLedger = Number(store.getState("next_ledger") ?? startLedger);
+  const savedNextLedger = store.getState("next_ledger");
+  let nextLedger = Number(savedNextLedger ?? startLedger);
+  if (savedNextLedger === null) store.setState("next_ledger", nextLedger);
   let pages = 0;
 
   while (pages < maxPages) {

@@ -29,10 +29,14 @@ function event({ id = "event-1", from = sender, to = treasury, amount = 125n, le
   };
 }
 
-function createStore() {
+function createStorePath() {
   const directory = mkdtempSync(join(tmpdir(), "accord-indexer-"));
   tempDirectories.push(directory);
-  return openLedgerStore(join(directory, "ledger.sqlite"));
+  return join(directory, "ledger.sqlite");
+}
+
+function createStore() {
+  return openLedgerStore(createStorePath());
 }
 
 afterEach(() => {
@@ -139,6 +143,94 @@ describe("treasury ledger", () => {
     );
     assert.equal(store.getState("next_ledger"), "44");
     assert.equal(store.getState("event_cursor"), "");
+    store.close();
+  });
+
+  it("persists the initial checkpoint and resumes a partially processed page after restart", async () => {
+    const databasePath = createStorePath();
+    let store = openLedgerStore(databasePath);
+    const initialRequests = [];
+    let initialCall = 0;
+
+    await assert.rejects(
+      indexEventBatch({
+        stellar: {
+          getEvents: async (request) => {
+            initialRequests.push(request);
+            if (initialCall++ === 0) {
+              return {
+                events: [
+                  event({ id: "event-1", amount: 10n }),
+                  event({ id: "event-2", amount: 20n }),
+                ],
+                cursor: "page-1",
+                latestLedger: 42,
+              };
+            }
+            throw new Error("RPC unavailable");
+          },
+        },
+        store,
+        tokens: [{ name: "USDC", address: tokenAddress }],
+        treasuryAddress: treasury,
+        startLedger: 40,
+        pageLimit: 2,
+      }),
+      /RPC unavailable/
+    );
+
+    assert.equal(initialRequests[0].startLedger, 40);
+    assert.equal(store.getState("next_ledger"), "40");
+    assert.equal(store.getState("event_cursor"), "page-1");
+    assert.equal(store.getEntries({ token: "USDC", limit: 10, offset: 0 }).length, 2);
+    store.close();
+
+    store = openLedgerStore(databasePath);
+    const resumedRequests = [];
+    await indexEventBatch({
+      stellar: {
+        getEvents: async (request) => {
+          resumedRequests.push(request);
+          return {
+            events: [event({ id: "event-3", amount: 30n, ledger: 43 })],
+            latestLedger: 43,
+          };
+        },
+      },
+      store,
+      tokens: [{ name: "USDC", address: tokenAddress }],
+      treasuryAddress: treasury,
+      startLedger: 999,
+      pageLimit: 2,
+    });
+
+    assert.equal(resumedRequests[0].cursor, "page-1");
+    assert.deepEqual(
+      store.getEntries({ token: "USDC", limit: 10, offset: 0 }).map(({ eventId, balance }) => [eventId, balance]),
+      [["event-1", "10"], ["event-2", "30"], ["event-3", "60"]]
+    );
+    assert.equal(store.getState("next_ledger"), "44");
+    assert.equal(store.getState("event_cursor"), "");
+    store.close();
+
+    store = openLedgerStore(databasePath);
+    const liveRequests = [];
+    await indexEventBatch({
+      stellar: {
+        getEvents: async (request) => {
+          liveRequests.push(request);
+          return { events: [], latestLedger: 44 };
+        },
+      },
+      store,
+      tokens: [{ name: "USDC", address: tokenAddress }],
+      treasuryAddress: treasury,
+      startLedger: 999,
+      pageLimit: 2,
+    });
+
+    assert.equal(liveRequests[0].startLedger, 44);
+    assert.equal(store.getState("next_ledger"), "45");
     store.close();
   });
 });
